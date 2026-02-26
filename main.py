@@ -7,6 +7,7 @@ import io
 
 app = FastAPI()
 
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,11 +16,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ---------------- Prétraitement image ----------------
 def preprocess_image(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # Augmenter résolution
+    # Augmenter la résolution (important pour OCR)
     image = cv2.resize(image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -27,7 +29,7 @@ def preprocess_image(contents):
     # Améliorer contraste
     gray = cv2.equalizeHist(gray)
 
-    # Adaptive threshold
+    # Adaptive threshold (meilleur que OTSU pour factures)
     thresh = cv2.adaptiveThreshold(
         gray,
         255,
@@ -40,16 +42,17 @@ def preprocess_image(contents):
     return thresh
 
 
+# ---------------- Endpoint OCR ----------------
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
     try:
         contents = await file.read()
 
-        processed = preprocess_image(contents)
+        processed_image = preprocess_image(contents)
 
         text = pytesseract.image_to_string(
-            processed,
-            lang="eng",
+            processed_image,
+            lang="fra",                 # ← LANGUE FRANÇAISE
             config="--oem 3 --psm 6"
         )
 
