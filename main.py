@@ -1,50 +1,13 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import create_engine, Column, Integer, String, Float, Text
-from sqlalchemy.orm import declarative_base, sessionmaker
+from datetime import datetime
 import pytesseract
 import cv2
 import numpy as np
 import re
-import datetime
+import sqlite3
 
 app = FastAPI()
-
-# =====================================================
-# DATABASE
-# =====================================================
-
-DATABASE_URL = "sqlite:///./factures.db"
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
-
-class Facture(Base):
-    __tablename__ = "factures"
-
-    id = Column(Integer, primary_key=True)
-    type_document = Column(String)
-    numero_facture = Column(String)
-    numero_commande = Column(String)
-    date_facture = Column(String)
-    colis = Column(Integer)
-    casier = Column(Integer)
-    emb_plein = Column(Integer)
-    emb_vide = Column(Integer)
-    montant_ht = Column(Float)
-    tva = Column(Float)
-    montant_ttc = Column(Float)
-    net_a_payer = Column(Float)
-    devise = Column(String)
-    ocr_confidence = Column(Float)
-    raw_text = Column(Text)
-    created_at = Column(String)
-
-Base.metadata.create_all(bind=engine)
-
-# =====================================================
-# CORS
-# =====================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -54,125 +17,152 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =====================================================
-# PREPROCESSING OPTIMISÉ
-# =====================================================
+# ==========================
+# DATABASE
+# ==========================
 
-def preprocess(contents):
+def init_db():
+    conn = sqlite3.connect("invoices.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS invoices (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            type_document TEXT,
+            numero_facture TEXT,
+            numero_commande TEXT,
+            date_facture TEXT,
+            colis INTEGER,
+            casier INTEGER,
+            emb_plein INTEGER,
+            emb_vide INTEGER,
+            montant_ttc REAL,
+            net_a_payer REAL,
+            devise TEXT,
+            ocr_confidence REAL,
+            created_at TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+# ==========================
+# IMAGE PREPROCESSING
+# ==========================
+
+def preprocess_image(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # 🔥 Upscale important pour petite police
-    image = cv2.resize(image, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
+    # Resize si trop large
+    h, w = image.shape[:2]
+    if w > 1200:
+        scale = 1200 / w
+        image = cv2.resize(image, (int(w * scale), int(h * scale)))
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # CLAHE contraste local
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
+    # Amélioration contraste
+    gray = cv2.equalizeHist(gray)
 
-    # Sharpen
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    gray = cv2.filter2D(gray, -1, kernel)
+    # Suppression bruit
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
-    return gray
-
-# =====================================================
-# OCR
-# =====================================================
-
-def run_ocr(image):
-
-    data = pytesseract.image_to_data(
-        image,
-        lang="fra",
-        config="--oem 3 --psm 4",
-        output_type=pytesseract.Output.DICT
+    # Adaptive threshold (robuste fond variable)
+    thresh = cv2.adaptiveThreshold(
+        gray,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        31,
+        2
     )
 
+    return thresh
+
+# ==========================
+# OCR CONFIDENCE
+# ==========================
+
+def get_ocr_confidence(image):
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
     confidences = [int(conf) for conf in data["conf"] if conf != "-1"]
-    confidence = round(sum(confidences)/len(confidences),2) if confidences else 0
+    if confidences:
+        return round(sum(confidences) / len(confidences), 2)
+    return 0.0
 
-    text = pytesseract.image_to_string(
-        image,
-        lang="fra",
-        config="--oem 3 --psm 4"
-    )
+# ==========================
+# CLEAN HELPERS
+# ==========================
 
-    return text, confidence
-
-# =====================================================
-# OUTILS
-# =====================================================
-
-def clean_amount(value):
-    value = value.replace(" ", "").replace(",", ".")
+def clean_amount(text):
     try:
-        return float(value)
+        text = text.replace(" ", "")
+        return float(text)
     except:
         return None
 
-def clean_int(value):
+def clean_int(text):
     try:
-        return int(re.sub(r"\D", "", value))
+        return int(text)
     except:
         return None
 
-# =====================================================
+# ==========================
 # EXTRACTION INTELLIGENTE
-# =====================================================
+# ==========================
 
 def extract_data(text):
 
     clean_text = re.sub(r'\s+', ' ', text)
     lower = clean_text.lower()
 
-    # Type document
+    # TYPE
     type_doc = "FACTURE" if "facture" in lower else None
 
-    # Numéro facture
+    # NUMERO FACTURE
     match_num = re.search(r'facture\s*n?[°o]?\s*(\d+)', lower)
     numero_facture = match_num.group(1) if match_num else None
 
-    # Date
+    # DATE
     match_date = re.search(r'\d{2}/\d{2}/\d{4}', clean_text)
     date = match_date.group() if match_date else None
 
-    # Numéro commande
-    match_commande = re.search(r'commande\s*[:\-]?\s*([a-zA-Z0-9]+)', lower)
-    numero_commande = match_commande.group(1) if match_commande else None
+    # EXTRACTION MONTANTS
+    numbers = re.findall(r'\d[\d\s]{2,}', clean_text)
+    amounts = []
 
-    # Colis
+    for n in numbers:
+        val = clean_amount(n)
+        if val and val > 1000:
+            amounts.append(val)
+
+    amounts = sorted(amounts)
+
+    net_a_payer = amounts[-1] if amounts else None
+    montant_ttc = amounts[-2] if len(amounts) > 1 else None
+
+    # COLIS
     match_colis = re.search(r'colis\s*[:\-]?\s*(\d+)', lower)
     colis = clean_int(match_colis.group(1)) if match_colis else None
 
-    # Casier
+    # CASIER
     match_casier = re.search(r'casier\s*[:\-]?\s*(\d+)', lower)
     casier = clean_int(match_casier.group(1)) if match_casier else None
 
-    # EMB plein
+    # EMB
     match_emb_plein = re.search(r'emb\s*plein\s*[:\-]?\s*(\d+)', lower)
     emb_plein = clean_int(match_emb_plein.group(1)) if match_emb_plein else None
 
-    # EMB vide
     match_emb_vide = re.search(r'emb\s*vide\s*[:\-]?\s*(\d+)', lower)
     emb_vide = clean_int(match_emb_vide.group(1)) if match_emb_vide else None
 
-    # Devise
+    # NUMERO COMMANDE
+    match_commande = re.search(r'[A-Z]{1,3}\d{5,}', clean_text)
+    numero_commande = match_commande.group() if match_commande else None
+
     devise = "FCFA" if "fcfa" in lower else None
-
-    # Montants
-    match_ht = re.search(r'(ht).*?(\d[\d\s.,]+)', lower)
-    montant_ht = clean_amount(match_ht.group(2)) if match_ht else None
-
-    match_tva = re.search(r'(tva).*?(\d[\d\s.,]+)', lower)
-    tva = clean_amount(match_tva.group(2)) if match_tva else None
-
-    match_ttc = re.search(r'(ttc).*?(\d[\d\s.,]+)', lower)
-    montant_ttc = clean_amount(match_ttc.group(2)) if match_ttc else None
-
-    match_net = re.search(r'net\s*a\s*payer.*?(\d[\d\s.,]+)', lower)
-    net_a_payer = clean_amount(match_net.group(1)) if match_net else None
 
     return {
         "type_document": type_doc,
@@ -183,54 +173,74 @@ def extract_data(text):
         "casier": casier,
         "emb_plein": emb_plein,
         "emb_vide": emb_vide,
-        "montant_ht": montant_ht,
-        "tva": tva,
         "montant_ttc": montant_ttc,
         "net_a_payer": net_a_payer,
         "devise": devise
     }
 
-# =====================================================
-# ENDPOINT OCR
-# =====================================================
+# ==========================
+# ROUTES
+# ==========================
 
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
-    try:
-        contents = await file.read()
 
-        processed = preprocess(contents)
-        text, confidence = run_ocr(processed)
+    contents = await file.read()
+    processed = preprocess_image(contents)
 
-        data = extract_data(text)
+    text = pytesseract.image_to_string(
+        processed,
+        lang="fra",
+        config="--oem 3 --psm 6"
+    )
 
-        db = SessionLocal()
-        facture = Facture(
-            **data,
-            ocr_confidence=confidence,
-            raw_text=text,
-            created_at=str(datetime.datetime.now())
+    confidence = get_ocr_confidence(processed)
+
+    extracted = extract_data(text)
+
+    # Save DB
+    conn = sqlite3.connect("invoices.db")
+    cursor = conn.cursor()
+
+    cursor.execute("""
+        INSERT INTO invoices (
+            type_document, numero_facture, numero_commande,
+            date_facture, colis, casier,
+            emb_plein, emb_vide,
+            montant_ttc, net_a_payer,
+            devise, ocr_confidence, created_at
         )
-        db.add(facture)
-        db.commit()
-        db.close()
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        extracted["type_document"],
+        extracted["numero_facture"],
+        extracted["numero_commande"],
+        extracted["date_facture"],
+        extracted["colis"],
+        extracted["casier"],
+        extracted["emb_plein"],
+        extracted["emb_vide"],
+        extracted["montant_ttc"],
+        extracted["net_a_payer"],
+        extracted["devise"],
+        confidence,
+        datetime.now().isoformat()
+    ))
 
-        return {
-            "success": True,
-            "ocr_confidence": confidence,
-            "extracted_data": data
-        }
+    conn.commit()
+    conn.close()
 
-    except Exception as e:
-        return {"success": False, "error": str(e)}
-
-# =====================================================
-# GET FACTURES
-# =====================================================
+    return {
+        "success": True,
+        "ocr_confidence": confidence,
+        "extracted_data": extracted
+    }
 
 @app.get("/factures")
-def get_factures():
-    db = SessionLocal()
-    factures = db.query(Facture).all()
-    db.close()
-    return factures
+def get_invoices():
+    conn = sqlite3.connect("invoices.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM invoices ORDER BY id DESC")
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
