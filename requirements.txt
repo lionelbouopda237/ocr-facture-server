@@ -3,6 +3,4 @@ uvicorn
 pytesseract
 opencv-python-headless
 numpy
-sqlalchemy
-pillow
 python-multipart
