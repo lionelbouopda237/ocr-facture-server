@@ -1,15 +1,18 @@
-# VERSION OPTIMISÉE PETITES FACTURES
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, Float, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
-import pytesseract
+import easyocr
 import cv2
 import numpy as np
 import re
 import datetime
 
 app = FastAPI()
+
+# ==========================
+# DATABASE
+# ==========================
 
 DATABASE_URL = "sqlite:///./factures.db"
 engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
@@ -31,6 +34,10 @@ class Facture(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# ==========================
+# CORS
+# ==========================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -39,56 +46,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# =========================
-# PREPROCESSING OPTIMISÉ
-# =========================
+# ==========================
+# EASY OCR (chargé une seule fois)
+# ==========================
+
+reader = easyocr.Reader(['fr'], gpu=False)
+
+# ==========================
+# PREPROCESSING
+# ==========================
 
 def preprocess(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # 🔥 Agrandissement (clé)
-    image = cv2.resize(image, None, fx=1.8, fy=1.8, interpolation=cv2.INTER_CUBIC)
+    # Agrandir image (important pour petites factures)
+    image = cv2.resize(image, None, fx=1.5, fy=1.5, interpolation=cv2.INTER_CUBIC)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    # CLAHE
-    clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
-
-    # Sharpen
-    kernel = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]])
-    gray = cv2.filter2D(gray, -1, kernel)
-
     return gray
 
-# =========================
-# OCR
-# =========================
-
-def run_ocr(image):
-
-    data = pytesseract.image_to_data(
-        image,
-        lang="fra",
-        config="--oem 3 --psm 4",
-        output_type=pytesseract.Output.DICT
-    )
-
-    confidences = [int(conf) for conf in data["conf"] if conf != "-1"]
-    confidence = round(sum(confidences)/len(confidences),2) if confidences else 0
-
-    text = pytesseract.image_to_string(
-        image,
-        lang="fra",
-        config="--oem 3 --psm 4"
-    )
-
-    return text, confidence
-
-# =========================
+# ==========================
 # EXTRACTION
-# =========================
+# ==========================
 
 def clean_amount(value):
     value = value.replace(" ", "").replace(",", ".")
@@ -109,26 +90,36 @@ def extract_data(text):
 
     return date, net
 
-# =========================
-# ENDPOINT
-# =========================
+# ==========================
+# ENDPOINT OCR
+# ==========================
 
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
     try:
         contents = await file.read()
+        image = preprocess(contents)
 
-        processed = preprocess(contents)
-        text, confidence = run_ocr(processed)
-        date, net = extract_data(text)
+        results = reader.readtext(image)
+
+        extracted_text = ""
+        confidences = []
+
+        for (bbox, text, confidence) in results:
+            extracted_text += text + " "
+            confidences.append(confidence)
+
+        avg_confidence = round(sum(confidences)/len(confidences)*100, 2) if confidences else 0
+
+        date, net = extract_data(extracted_text)
 
         db = SessionLocal()
         facture = Facture(
             type_document="FACTURE",
             date_facture=date,
             net_a_payer=net,
-            ocr_confidence=confidence,
-            raw_text=text,
+            ocr_confidence=avg_confidence,
+            raw_text=extracted_text,
             created_at=str(datetime.datetime.now())
         )
         db.add(facture)
@@ -137,7 +128,7 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
         return {
             "success": True,
-            "ocr_confidence": confidence,
+            "ocr_confidence": avg_confidence,
             "extracted_data": {
                 "date": date,
                 "net_a_payer": net
@@ -146,6 +137,10 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+# ==========================
+# GET FACTURES
+# ==========================
 
 @app.get("/factures")
 def get_factures():
