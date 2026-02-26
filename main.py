@@ -1,18 +1,18 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
-from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy import create_engine, Column, Integer, String, Float, Text
 from sqlalchemy.orm import declarative_base, sessionmaker
 import pytesseract
 import cv2
 import numpy as np
 import re
+import datetime
 
 app = FastAPI()
 
-# ==========================
-# BASE DE DONNÉES SQLITE
-# ==========================
+# =====================================================
+# DATABASE
+# =====================================================
 
 DATABASE_URL = "sqlite:///./factures.db"
 
@@ -26,15 +26,21 @@ class Facture(Base):
     id = Column(Integer, primary_key=True, index=True)
     fournisseur = Column(String)
     numero_facture = Column(String)
-    date = Column(String)
+    date_facture = Column(String)
+    type_document = Column(String)
     net_a_payer = Column(Float)
+    montant_ht = Column(Float)
+    montant_tva = Column(Float)
+    montant_ttc = Column(Float)
     ocr_confidence = Column(Float)
+    raw_text = Column(Text)
+    created_at = Column(String)
 
 Base.metadata.create_all(bind=engine)
 
-# ==========================
+# =====================================================
 # CORS
-# ==========================
+# =====================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -44,49 +50,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==========================
-# PREPROCESSING
-# ==========================
+# =====================================================
+# MULTI PREPROCESSING
+# =====================================================
 
-def preprocess_image(contents):
+def preprocess_variants(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-    gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    thresh = cv2.adaptiveThreshold(
-        gray,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        31,
-        2
-    )
+    variants = []
 
-    return thresh
+    # Version 1 : CLAHE
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+    v1 = clahe.apply(gray)
+    variants.append(v1)
 
-# ==========================
-# SCORE OCR
-# ==========================
+    # Version 2 : Bilateral
+    v2 = cv2.bilateralFilter(gray, 9, 75, 75)
+    variants.append(v2)
 
-def compute_ocr_confidence(image):
-    data = pytesseract.image_to_data(image, lang="fra", output_type=pytesseract.Output.DICT)
+    # Version 3 : Simple grayscale
+    variants.append(gray)
 
-    confidences = [
-        int(conf)
-        for conf in data["conf"]
-        if conf != "-1"
+    return variants
+
+# =====================================================
+# OCR MULTI CONFIG
+# =====================================================
+
+def run_best_ocr(images):
+
+    configs = [
+        "--oem 3 --psm 6",
+        "--oem 3 --psm 4",
+        "--oem 3 --psm 11"
     ]
 
-    if len(confidences) == 0:
-        return 0
+    best_text = ""
+    best_conf = 0
 
-    return round(sum(confidences) / len(confidences), 2)
+    for img in images:
+        for config in configs:
 
-# ==========================
-# EXTRACTION
-# ==========================
+            data = pytesseract.image_to_data(
+                img,
+                lang="fra",
+                config=config,
+                output_type=pytesseract.Output.DICT
+            )
+
+            confidences = [
+                int(conf)
+                for conf in data["conf"]
+                if conf != "-1"
+            ]
+
+            if not confidences:
+                continue
+
+            avg_conf = sum(confidences) / len(confidences)
+
+            if avg_conf > best_conf:
+                best_conf = avg_conf
+                best_text = pytesseract.image_to_string(
+                    img,
+                    lang="fra",
+                    config=config
+                )
+
+    return best_text, round(best_conf, 2)
+
+# =====================================================
+# EXTRACTION MAXIMALE
+# =====================================================
 
 def clean_amount(value):
     value = value.replace(" ", "").replace(",", ".")
@@ -95,76 +133,103 @@ def clean_amount(value):
     except:
         return None
 
-def extract_data(text):
+def detect_type(text):
+    t = text.lower()
+    if "devis" in t:
+        return "DEVIS"
+    if "bon de livraison" in t:
+        return "BON_LIVRAISON"
+    if "avoir" in t:
+        return "AVOIR"
+    if "facture" in t:
+        return "FACTURE"
+    return "INCONNU"
+
+def extract_all(text):
 
     clean_text = re.sub(r'\s+', ' ', text)
 
-    lines = text.split("\n")
-    fournisseur = None
-    for line in lines:
-        if len(line.strip()) > 5 and line.isupper():
-            fournisseur = line.strip()
-            break
+    # Dates
+    dates = re.findall(r'\d{2}/\d{2}/\d{4}', clean_text)
 
-    invoice_number = None
-    match_invoice = re.search(r'(facture|invoice).*?(\w+)', clean_text, re.IGNORECASE)
-    if match_invoice:
-        invoice_number = match_invoice.group(2)
+    # Numéros potentiels
+    numeros = re.findall(r'(facture|invoice).*?(\w+)', clean_text, re.IGNORECASE)
 
-    date = None
-    match_date = re.search(r'\d{2}/\d{2}/\d{4}', clean_text)
-    if match_date:
-        date = match_date.group()
+    # Montants
+    montants_bruts = re.findall(r'\d[\d\s.,]+', clean_text)
+    montants = [clean_amount(m) for m in montants_bruts]
+    montants = [m for m in montants if m and m > 100]
 
-    net_a_payer = None
+    # Champs spécifiques
+    montant_ht = None
+    montant_tva = None
+    montant_ttc = None
+    net = None
+
+    match_ht = re.search(r'(ht|hors taxe).*?(\d[\d\s.,]+)', clean_text, re.IGNORECASE)
+    if match_ht:
+        montant_ht = clean_amount(match_ht.group(2))
+
+    match_tva = re.search(r'(tva).*?(\d[\d\s.,]+)', clean_text, re.IGNORECASE)
+    if match_tva:
+        montant_tva = clean_amount(match_tva.group(2))
+
+    match_ttc = re.search(r'(ttc).*?(\d[\d\s.,]+)', clean_text, re.IGNORECASE)
+    if match_ttc:
+        montant_ttc = clean_amount(match_ttc.group(2))
+
     match_net = re.search(r'net\s*a\s*payer.*?(\d[\d\s.,]+)', clean_text, re.IGNORECASE)
     if match_net:
-        net_a_payer = clean_amount(match_net.group(1))
+        net = clean_amount(match_net.group(1))
 
-    return fournisseur, invoice_number, date, net_a_payer
+    return {
+        "type_document": detect_type(text),
+        "dates_detectees": dates,
+        "numeros_detectes": numeros,
+        "tous_montants": montants,
+        "montant_ht": montant_ht,
+        "montant_tva": montant_tva,
+        "montant_ttc": montant_ttc,
+        "net_a_payer": net
+    }
 
-# ==========================
-# ENDPOINT PRINCIPAL
-# ==========================
+# =====================================================
+# ENDPOINT
+# =====================================================
 
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-        processed = preprocess_image(contents)
 
-        text = pytesseract.image_to_string(
-            processed,
-            lang="fra",
-            config="--oem 3 --psm 6"
-        )
+        variants = preprocess_variants(contents)
 
-        confidence = compute_ocr_confidence(processed)
+        text, confidence = run_best_ocr(variants)
 
-        fournisseur, numero_facture, date, net_a_payer = extract_data(text)
+        extracted = extract_all(text)
 
-        # Sauvegarde en base
         db = SessionLocal()
-        nouvelle_facture = Facture(
-            fournisseur=fournisseur,
-            numero_facture=numero_facture,
-            date=date,
-            net_a_payer=net_a_payer,
-            ocr_confidence=confidence
+        facture = Facture(
+            fournisseur=None,
+            numero_facture=None,
+            date_facture=extracted["dates_detectees"][0] if extracted["dates_detectees"] else None,
+            type_document=extracted["type_document"],
+            montant_ht=extracted["montant_ht"],
+            montant_tva=extracted["montant_tva"],
+            montant_ttc=extracted["montant_ttc"],
+            net_a_payer=extracted["net_a_payer"],
+            ocr_confidence=confidence,
+            raw_text=text,
+            created_at=str(datetime.datetime.now())
         )
-        db.add(nouvelle_facture)
+        db.add(facture)
         db.commit()
         db.close()
 
         return {
             "success": True,
             "ocr_confidence": confidence,
-            "extracted_data": {
-                "fournisseur": fournisseur,
-                "numero_facture": numero_facture,
-                "date": date,
-                "net_a_payer": net_a_payer
-            }
+            "extracted_data": extracted
         }
 
     except Exception as e:
@@ -173,14 +238,9 @@ async def ocr_invoice(file: UploadFile = File(...)):
             "error": str(e)
         }
 
-# ==========================
-# ENDPOINT LISTE FACTURES
-# ==========================
-
 @app.get("/factures")
 def get_factures():
     db = SessionLocal()
     factures = db.query(Facture).all()
     db.close()
-
     return factures
