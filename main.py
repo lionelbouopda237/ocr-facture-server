@@ -1,11 +1,40 @@
 from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from typing import List
+from sqlalchemy import create_engine, Column, Integer, String, Float
+from sqlalchemy.orm import declarative_base, sessionmaker
 import pytesseract
 import cv2
 import numpy as np
 import re
 
 app = FastAPI()
+
+# ==========================
+# BASE DE DONNÉES SQLITE
+# ==========================
+
+DATABASE_URL = "sqlite:///./factures.db"
+
+engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class Facture(Base):
+    __tablename__ = "factures"
+
+    id = Column(Integer, primary_key=True, index=True)
+    fournisseur = Column(String)
+    numero_facture = Column(String)
+    date = Column(String)
+    net_a_payer = Column(Float)
+    ocr_confidence = Column(Float)
+
+Base.metadata.create_all(bind=engine)
+
+# ==========================
+# CORS
+# ==========================
 
 app.add_middleware(
     CORSMiddleware,
@@ -16,30 +45,16 @@ app.add_middleware(
 )
 
 # ==========================
-# PREPROCESSING AVANCÉ
+# PREPROCESSING
 # ==========================
 
 def preprocess_image(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    height, width = image.shape[:2]
-    max_width = 1600
-
-    if width > max_width:
-        scale = max_width / width
-        image = cv2.resize(image, (int(width * scale), int(height * scale)))
-
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
-    # Débruitage plus avancé
     gray = cv2.bilateralFilter(gray, 9, 75, 75)
 
-    # Augmentation contraste
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-    gray = clahe.apply(gray)
-
-    # Threshold adaptatif
     thresh = cv2.adaptiveThreshold(
         gray,
         255,
@@ -51,58 +66,62 @@ def preprocess_image(contents):
 
     return thresh
 
+# ==========================
+# SCORE OCR
+# ==========================
+
+def compute_ocr_confidence(image):
+    data = pytesseract.image_to_data(image, lang="fra", output_type=pytesseract.Output.DICT)
+
+    confidences = [
+        int(conf)
+        for conf in data["conf"]
+        if conf != "-1"
+    ]
+
+    if len(confidences) == 0:
+        return 0
+
+    return round(sum(confidences) / len(confidences), 2)
 
 # ==========================
-# EXTRACTION INTELLIGENTE
+# EXTRACTION
 # ==========================
+
+def clean_amount(value):
+    value = value.replace(" ", "").replace(",", ".")
+    try:
+        return float(value)
+    except:
+        return None
 
 def extract_data(text):
 
-    # Nettoyage espaces multiples
     clean_text = re.sub(r'\s+', ' ', text)
 
-    # Numéro facture
+    lines = text.split("\n")
+    fournisseur = None
+    for line in lines:
+        if len(line.strip()) > 5 and line.isupper():
+            fournisseur = line.strip()
+            break
+
     invoice_number = None
-    match_invoice = re.search(r'facture\s*(n°|no|numero)?\s*[:\-]?\s*(\w+)', clean_text, re.IGNORECASE)
+    match_invoice = re.search(r'(facture|invoice).*?(\w+)', clean_text, re.IGNORECASE)
     if match_invoice:
         invoice_number = match_invoice.group(2)
 
-    # Date
     date = None
     match_date = re.search(r'\d{2}/\d{2}/\d{4}', clean_text)
     if match_date:
         date = match_date.group()
 
-    # Montants (tous les nombres format argent)
-    amounts = re.findall(r'\d{1,3}(?:[\s.,]\d{3})*(?:[.,]\d{2})?', clean_text)
-
-    # Nettoyage montants
-    numeric_amounts = []
-    for amt in amounts:
-        cleaned = amt.replace(" ", "").replace(",", ".")
-        try:
-            numeric_amounts.append(float(cleaned))
-        except:
-            pass
-
-    # Détection net à payer (priorité)
     net_a_payer = None
     match_net = re.search(r'net\s*a\s*payer.*?(\d[\d\s.,]+)', clean_text, re.IGNORECASE)
     if match_net:
-        raw_net = match_net.group(1)
-        raw_net = raw_net.replace(" ", "").replace(",", ".")
-        try:
-            net_a_payer = float(raw_net)
-        except:
-            pass
+        net_a_payer = clean_amount(match_net.group(1))
 
-    return {
-        "numero_facture": invoice_number,
-        "date": date,
-        "net_a_payer": net_a_payer,
-        "montants_detectes": numeric_amounts
-    }
-
+    return fournisseur, invoice_number, date, net_a_payer
 
 # ==========================
 # ENDPOINT PRINCIPAL
@@ -112,21 +131,40 @@ def extract_data(text):
 async def ocr_invoice(file: UploadFile = File(...)):
     try:
         contents = await file.read()
-
         processed = preprocess_image(contents)
 
         text = pytesseract.image_to_string(
             processed,
             lang="fra",
-            config="--oem 3 --psm 6 -c preserve_interword_spaces=1"
+            config="--oem 3 --psm 6"
         )
 
-        extracted = extract_data(text)
+        confidence = compute_ocr_confidence(processed)
+
+        fournisseur, numero_facture, date, net_a_payer = extract_data(text)
+
+        # Sauvegarde en base
+        db = SessionLocal()
+        nouvelle_facture = Facture(
+            fournisseur=fournisseur,
+            numero_facture=numero_facture,
+            date=date,
+            net_a_payer=net_a_payer,
+            ocr_confidence=confidence
+        )
+        db.add(nouvelle_facture)
+        db.commit()
+        db.close()
 
         return {
             "success": True,
-            "raw_text": text,
-            "extracted_data": extracted
+            "ocr_confidence": confidence,
+            "extracted_data": {
+                "fournisseur": fournisseur,
+                "numero_facture": numero_facture,
+                "date": date,
+                "net_a_payer": net_a_payer
+            }
         }
 
     except Exception as e:
@@ -134,3 +172,15 @@ async def ocr_invoice(file: UploadFile = File(...)):
             "success": False,
             "error": str(e)
         }
+
+# ==========================
+# ENDPOINT LISTE FACTURES
+# ==========================
+
+@app.get("/factures")
+def get_factures():
+    db = SessionLocal()
+    factures = db.query(Facture).all()
+    db.close()
+
+    return factures
