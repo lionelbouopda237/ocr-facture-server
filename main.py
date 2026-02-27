@@ -21,7 +21,7 @@ app.add_middleware(
 # ==========================
 # INITIALISATION OCR
 # ==========================
-reader = easyocr.Reader(['fr'], gpu=False)  # On désactive GPU pour Render Free
+reader = easyocr.Reader(['fr'], gpu=False)  # Désactivation du GPU pour Render Free
 
 # ==========================
 # BASE DE DONNÉES
@@ -78,7 +78,7 @@ def preprocess_image(contents):
     return thresh
 
 # ==========================
-# OCR - EASYOCR + TESSERACT
+# OCR - EASY OCR + TESSERACT (Fallback)
 # ==========================
 def run_ocr(image):
     # EASY OCR
