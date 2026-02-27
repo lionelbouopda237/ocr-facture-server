@@ -21,13 +21,11 @@ app.add_middleware(
 # ==========================
 # INITIALISATION OCR
 # ==========================
-
-reader = easyocr.Reader(['fr'], gpu=False)
+reader = easyocr.Reader(['fr'], gpu=False)  # On désactive GPU pour Render Free
 
 # ==========================
-# DATABASE
+# BASE DE DONNÉES
 # ==========================
-
 def init_db():
     conn = sqlite3.connect("invoices.db")
     cursor = conn.cursor()
@@ -55,9 +53,8 @@ def init_db():
 init_db()
 
 # ==========================
-# PREPROCESSING
+# PRÉPROCESSING IMAGE
 # ==========================
-
 def preprocess_image(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -81,17 +78,15 @@ def preprocess_image(contents):
     return thresh
 
 # ==========================
-# OCR ENSEMBLE
+# OCR - EASYOCR + TESSERACT
 # ==========================
-
 def run_ocr(image):
-
     # EASY OCR
     result = reader.readtext(image)
     easy_text = " ".join([r[1] for r in result])
     easy_conf = np.mean([r[2] for r in result]) * 100 if result else 0
 
-    # Fallback si faible
+    # Fallback si faible (Tesseract)
     if easy_conf < 40:
         tess_text = pytesseract.image_to_string(
             image,
@@ -108,9 +103,8 @@ def run_ocr(image):
     return easy_text, easy_conf
 
 # ==========================
-# EXTRACTION INTELLIGENTE
+# EXTRACTION DE DONNÉES
 # ==========================
-
 def clean_amount(text):
     try:
         return float(text.replace(" ", ""))
@@ -124,18 +118,21 @@ def clean_int(text):
         return None
 
 def extract_data(text):
-
     clean_text = re.sub(r'\s+', ' ', text)
     lower = clean_text.lower()
 
+    # TYPE DOCUMENT
     type_doc = "FACTURE" if "facture" in lower else None
 
+    # NUMERO FACTURE
     match_num = re.search(r'facture\s*n?[°o]?\s*(\d+)', lower)
     numero_facture = match_num.group(1) if match_num else None
 
+    # DATE
     match_date = re.search(r'\d{2}/\d{2}/\d{4}', clean_text)
     date = match_date.group() if match_date else None
 
+    # EXTRACTION DES MONTANTS
     numbers = re.findall(r'\d[\d\s]{2,}', clean_text)
     amounts = []
 
@@ -148,18 +145,22 @@ def extract_data(text):
     net_a_payer = amounts[-1] if amounts else None
     montant_ttc = amounts[-2] if len(amounts) > 1 else None
 
+    # COLIS
     match_colis = re.search(r'colis\s*[:\-]?\s*(\d+)', lower)
     colis = clean_int(match_colis.group(1)) if match_colis else None
 
+    # CASIER
     match_casier = re.search(r'casier\s*[:\-]?\s*(\d+)', lower)
     casier = clean_int(match_casier.group(1)) if match_casier else None
 
+    # EMB PLEIN / VIDE
     match_emb_plein = re.search(r'emb\s*plein\s*[:\-]?\s*(\d+)', lower)
     emb_plein = clean_int(match_emb_plein.group(1)) if match_emb_plein else None
 
     match_emb_vide = re.search(r'emb\s*vide\s*[:\-]?\s*(\d+)', lower)
     emb_vide = clean_int(match_emb_vide.group(1)) if match_emb_vide else None
 
+    # NUMERO COMMANDE (code alphanumérique)
     match_commande = re.search(r'[A-Z]{1,3}\d{5,}', clean_text)
     numero_commande = match_commande.group() if match_commande else None
 
@@ -182,10 +183,8 @@ def extract_data(text):
 # ==========================
 # ROUTES
 # ==========================
-
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
-
     contents = await file.read()
     processed = preprocess_image(contents)
 
