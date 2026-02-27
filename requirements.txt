@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 pytesseract
+opencv-python
 Pillow
 python-multipart
