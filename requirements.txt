@@ -1,6 +1,7 @@
-fastapi
-uvicorn
-pytesseract
-opencv-python
-Pillow
-python-multipart
+fastapi==0.75.0
+uvicorn==0.17.0
+tesseract-ocr==4.0.0
+opencv-python-headless==4.5.5.64
+numpy==1.21.2
+pillow==8.4.0
+python-multipart==0.0.5
