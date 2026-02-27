@@ -6,16 +6,25 @@ import numpy as np
 import re
 import sqlite3
 import pytesseract
+import easyocr
 
 app = FastAPI()
 
+# ==========================
+# Configuration CORS
+# ==========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # Permet toutes les origines (change selon ton besoin)
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["*"],  # Permet toutes les méthodes HTTP
+    allow_headers=["*"],  # Permet tous les headers
 )
+
+# ==========================
+# Initialisation OCR
+# ==========================
+reader = easyocr.Reader(['fr'], gpu=False)  # Mode CPU activé pour éviter les problèmes de mémoire
 
 # ==========================
 # BASE DE DONNÉES
@@ -47,13 +56,13 @@ def init_db():
 init_db()
 
 # ==========================
-# PRÉPROCESSING IMAGE (Optimisation de la mémoire)
+# Préprocessing de l'image (réduction de la taille)
 # ==========================
 def preprocess_image(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-    # Limiter la largeur à 800px (réduction de la taille pour économiser la mémoire)
+    # Limiter la largeur à 800px pour économiser la mémoire
     h, w = image.shape[:2]
     max_width = 800
     if w > max_width:
@@ -74,23 +83,32 @@ def preprocess_image(contents):
     return thresh
 
 # ==========================
-# OCR - TESSERACT (SEULEMENT)
+# Fonction OCR (Tesseract + EasyOCR si nécessaire)
 # ==========================
 def run_ocr(image):
-    # Utilisation de Tesseract uniquement pour extraire le texte
-    text = pytesseract.image_to_string(
-        image,
-        lang="fra",
-        config="--oem 3 --psm 6"
-    )
-    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-    confs = [int(c) for c in data["conf"] if c != "-1"]
-    confidence = sum(confs) / len(confs) if confs else 0
+    # Utilisation de EasyOCR pour extraire le texte
+    result = reader.readtext(image)
+    easy_text = " ".join([r[1] for r in result])
+    easy_conf = np.mean([r[2] for r in result]) * 100 if result else 0
 
-    return text, confidence
+    # Si la confiance d'EasyOCR est faible, utiliser Tesseract
+    if easy_conf < 40:
+        tess_text = pytesseract.image_to_string(
+            image,
+            lang="fra",
+            config="--oem 3 --psm 6"
+        )
+        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+        confs = [int(c) for c in data["conf"] if c != "-1"]
+        tess_conf = sum(confs) / len(confs) if confs else 0
+
+        if tess_conf > easy_conf:
+            return tess_text, tess_conf
+
+    return easy_text, easy_conf
 
 # ==========================
-# EXTRACTION DES DONNÉES
+# Extraction des données
 # ==========================
 def clean_amount(text):
     try:
@@ -108,21 +126,20 @@ def extract_data(text):
     clean_text = re.sub(r'\s+', ' ', text)
     lower = clean_text.lower()
 
-    # TYPE DOCUMENT
+    # Type document
     type_doc = "FACTURE" if "facture" in lower else None
 
-    # NUMERO FACTURE
+    # Numéro de facture
     match_num = re.search(r'facture\s*n?[°o]?\s*(\d+)', lower)
     numero_facture = match_num.group(1) if match_num else None
 
-    # DATE
+    # Date
     match_date = re.search(r'\d{2}/\d{2}/\d{4}', clean_text)
     date = match_date.group() if match_date else None
 
-    # EXTRACTION DES MONTANTS
+    # Extraction des montants
     numbers = re.findall(r'\d[\d\s]{2,}', clean_text)
     amounts = []
-
     for n in numbers:
         val = clean_amount(n)
         if val and val > 1000:
@@ -132,22 +149,22 @@ def extract_data(text):
     net_a_payer = amounts[-1] if amounts else None
     montant_ttc = amounts[-2] if len(amounts) > 1 else None
 
-    # COLIS
+    # Colis
     match_colis = re.search(r'colis\s*[:\-]?\s*(\d+)', lower)
     colis = clean_int(match_colis.group(1)) if match_colis else None
 
-    # CASIER
+    # Casier
     match_casier = re.search(r'casier\s*[:\-]?\s*(\d+)', lower)
     casier = clean_int(match_casier.group(1)) if match_casier else None
 
-    # EMB PLEIN / VIDE
+    # Emballage Plein / Vide
     match_emb_plein = re.search(r'emb\s*plein\s*[:\-]?\s*(\d+)', lower)
     emb_plein = clean_int(match_emb_plein.group(1)) if match_emb_plein else None
 
     match_emb_vide = re.search(r'emb\s*vide\s*[:\-]?\s*(\d+)', lower)
     emb_vide = clean_int(match_emb_vide.group(1)) if match_emb_vide else None
 
-    # NUMERO COMMANDE (code alphanumérique)
+    # Numéro de commande (code alphanumérique)
     match_commande = re.search(r'[A-Z]{1,3}\d{5,}', clean_text)
     numero_commande = match_commande.group() if match_commande else None
 
@@ -168,7 +185,7 @@ def extract_data(text):
     }
 
 # ==========================
-# ROUTES
+# Routes
 # ==========================
 @app.post("/ocr")
 async def ocr_invoice(file: UploadFile = File(...)):
@@ -178,6 +195,7 @@ async def ocr_invoice(file: UploadFile = File(...)):
     text, confidence = run_ocr(processed)
     extracted = extract_data(text)
 
+    # Insertion des données dans la base SQLite
     conn = sqlite3.connect("invoices.db")
     cursor = conn.cursor()
 
