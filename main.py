@@ -6,7 +6,6 @@ import numpy as np
 import re
 import sqlite3
 import pytesseract
-import easyocr
 
 app = FastAPI()
 
@@ -17,11 +16,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ==========================
-# INITIALISATION OCR
-# ==========================
-reader = easyocr.Reader(['fr'], gpu=False)  # Mode CPU activé pour Render Free
 
 # ==========================
 # BASE DE DONNÉES
@@ -80,29 +74,20 @@ def preprocess_image(contents):
     return thresh
 
 # ==========================
-# OCR - EASY OCR + TESSERACT (Fallback en cas de faible confiance OCR)
+# OCR - TESSERACT (SEULEMENT)
 # ==========================
 def run_ocr(image):
-    # EASY OCR
-    result = reader.readtext(image)
-    easy_text = " ".join([r[1] for r in result])
-    easy_conf = np.mean([r[2] for r in result]) * 100 if result else 0
+    # Utilisation de Tesseract uniquement pour extraire le texte
+    text = pytesseract.image_to_string(
+        image,
+        lang="fra",
+        config="--oem 3 --psm 6"
+    )
+    data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
+    confs = [int(c) for c in data["conf"] if c != "-1"]
+    confidence = sum(confs) / len(confs) if confs else 0
 
-    # Fallback si faible confiance (Tesseract)
-    if easy_conf < 40:
-        tess_text = pytesseract.image_to_string(
-            image,
-            lang="fra",
-            config="--oem 3 --psm 6"
-        )
-        data = pytesseract.image_to_data(image, output_type=pytesseract.Output.DICT)
-        confs = [int(c) for c in data["conf"] if c != "-1"]
-        tess_conf = sum(confs)/len(confs) if confs else 0
-
-        if tess_conf > easy_conf:
-            return tess_text, tess_conf
-
-    return easy_text, easy_conf
+    return text, confidence
 
 # ==========================
 # EXTRACTION DES DONNÉES
