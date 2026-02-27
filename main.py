@@ -21,7 +21,7 @@ app.add_middleware(
 # ==========================
 # INITIALISATION OCR
 # ==========================
-reader = easyocr.Reader(['fr'], gpu=False)  # Désactivation du GPU pour Render Free
+reader = easyocr.Reader(['fr'], gpu=False)  # Mode CPU activé pour Render Free
 
 # ==========================
 # BASE DE DONNÉES
@@ -53,32 +53,34 @@ def init_db():
 init_db()
 
 # ==========================
-# PRÉPROCESSING IMAGE
+# PRÉPROCESSING IMAGE (Optimisation de la mémoire)
 # ==========================
 def preprocess_image(contents):
     np_arr = np.frombuffer(contents, np.uint8)
     image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
+    # Limiter la largeur à 800px (réduction de la taille pour économiser la mémoire)
     h, w = image.shape[:2]
-    if w > 1400:
-        scale = 1400 / w
+    max_width = 800
+    if w > max_width:
+        scale = max_width / w
         image = cv2.resize(image, (int(w * scale), int(h * scale)))
 
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     gray = cv2.equalizeHist(gray)
-    gray = cv2.GaussianBlur(gray, (3,3), 0)
+    gray = cv2.GaussianBlur(gray, (3, 3), 0)
 
     thresh = cv2.adaptiveThreshold(
-        gray,255,
+        gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY,
-        31,2
+        31, 2
     )
 
     return thresh
 
 # ==========================
-# OCR - EASY OCR + TESSERACT (Fallback)
+# OCR - EASY OCR + TESSERACT (Fallback en cas de faible confiance OCR)
 # ==========================
 def run_ocr(image):
     # EASY OCR
@@ -86,7 +88,7 @@ def run_ocr(image):
     easy_text = " ".join([r[1] for r in result])
     easy_conf = np.mean([r[2] for r in result]) * 100 if result else 0
 
-    # Fallback si faible (Tesseract)
+    # Fallback si faible confiance (Tesseract)
     if easy_conf < 40:
         tess_text = pytesseract.image_to_string(
             image,
@@ -103,7 +105,7 @@ def run_ocr(image):
     return easy_text, easy_conf
 
 # ==========================
-# EXTRACTION DE DONNÉES
+# EXTRACTION DES DONNÉES
 # ==========================
 def clean_amount(text):
     try:
@@ -224,7 +226,7 @@ async def ocr_invoice(file: UploadFile = File(...)):
 
     return {
         "success": True,
-        "ocr_confidence": round(confidence,2),
+        "ocr_confidence": round(confidence, 2),
         "extracted_data": extracted
     }
 
