@@ -4,5 +4,3 @@ pytesseract
 opencv-python-headless
 numpy
 python-multipart
-easyocr
-torch
